@@ -1,4 +1,17 @@
 #!/usr/bin/env python
+# Copyright 2015 CenturyLink
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#    http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 '''
 CenturyLink Cloud dynamic inventory script
@@ -34,9 +47,8 @@ from multiprocessing import Pool
 import itertools
 import json
 import clc
-from clc import CLCException
+from clc import CLCException, APIFailedResponse
 
-GROUP_POOL_CNT = 10
 HOSTVAR_POOL_CNT = 25
 
 
@@ -71,15 +83,11 @@ def print_inventory_json():
 def _find_all_groups():
     '''
     Obtain a list of all datacenters for the account, and then return a list of their Server Groups
-    Multithreaded to optimize network calls.
-    :cvar GROUP_POOL_CNT:  The number of processes to use.
     :return: group dictionary
     '''
-    p = Pool(GROUP_POOL_CNT)
     datacenters = _filter_datacenters(clc.v2.Datacenter.Datacenters())
-    results = p.map(_find_groups_for_datacenter, datacenters)
-    p.close()
-    p.join()
+    results = [_find_groups_for_datacenter(datacenter) for datacenter in datacenters]
+
     # Filter out results with no values
     results = [result for result in results if result]
     return _parse_groups_result_to_dict(results)
@@ -102,12 +110,30 @@ def _filter_datacenters(datacenters):
 def _find_groups_for_datacenter(datacenter):
     '''
     Return a dictionary of groups and hosts for the given datacenter
-    :param datacenter: The datacenter use for finding groups
+    :param datacenter: The datacenter to use for finding groups
     :return: dictionary of { '<GROUP NAME>': 'hosts': [SERVERS]}
     '''
+    result = {}
     groups = datacenter.Groups().groups
+    result = _find_all_servers_for_group( datacenter, groups )
+    if result:
+        return result
+
+def _find_all_servers_for_group( datacenter, groups):
+    '''
+    recursively walk down all groups retrieving server information.
+    :param datacenter: The datacenter being search.
+    :param groups: The current group level which is being searched.
+    :return: dictionary of {'<GROUP NAME>': 'hosts': [SERVERS]}
+    '''
     result = {}
     for group in groups:
+        sub_groups = group.Subgroups().groups
+        if ( len(sub_groups) > 0 ):
+            sub_result = {}
+            sub_result = _find_all_servers_for_group( datacenter, sub_groups )
+            if sub_result is not None:
+                result.update( sub_result )
 
         if group.type != 'default':
             continue
@@ -158,7 +184,14 @@ def _find_hostvars_single_server(server_id):
     '''
     result = {}
     try:
-        server = clc.v2.Server(server_id)
+        session = clc.requests.Session()
+
+        server_obj = clc.v2.API.Call(method='GET',
+                                     url='servers/{0}/{1}'.format(clc.ALIAS, server_id),
+                                     payload={},
+                                     session=session)
+
+        server = clc.v2.Server(id=server_id, server_obj=server_obj)
 
         if len(server.data['details']['ipAddresses']) == 0:
             return
@@ -168,10 +201,25 @@ def _find_hostvars_single_server(server_id):
             'clc_data': server.data,
             'clc_custom_fields': server.data['details']['customFields']
         }
-    except (CLCException, KeyError):
+        result = _add_windows_hostvars(result, server)
+    except (CLCException, APIFailedResponse, KeyError):
         return  # Skip any servers that return bad data or an api exception
 
     return result
+
+def _add_windows_hostvars(hostvars, server):
+    '''
+    Add windows specific hostvars if the OS is windows
+    :param server_id: the id of the server being checked
+    :return: a dictionary of windows specific hostvars
+    '''
+    if 'windows' in hostvars[server.name]['clc_data']['os']:
+        windows_hostvars = {
+            'ansible_ssh_port': 5986,
+            'ansible_connection': 'winrm'
+        }
+        hostvars[server.name].update(windows_hostvars)
+    return hostvars
 
 
 def _build_hostvars_dynamic_groups(hostvars):
