@@ -43,7 +43,7 @@ options:
   ports:
     description:
       - A list of structures specifying port (required), protocol ['TCP','UDP'] (required), and
-        port_to (optional)
+        port_to (optional; used when specifying a range of ports)
       - Example: {protocol: 'TCP', port: 10000, port_to: 10050}
     required: False
     default: None
